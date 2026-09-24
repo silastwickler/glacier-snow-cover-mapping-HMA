@@ -377,11 +377,38 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
     print(f'Number of date ranges to loop through = '+str(len(date_ranges)))
 
     # Run the workflow for each day in date range separately
+    #CST 09012026 im_xr_list needs to be initialized outside of the initial for loop
+    im_xr_list = []
     for date_range in tqdm(date_ranges):
         print(f'date range for image query = '+str(date_range))
         # Query for imagery
         if dataset == 'Landsat':
             # Get full collection for dates and bounds
+            
+            #CST 09102026 New cloud filter using Landsat CFMask
+            """
+            if mask_clouds:
+                print("Cloud Filter")
+                def mask_l8_cfmask(image):
+                    qa = image.select('QA_PIXEL')
+                    #Landsat Collection 2 Level-2 QA_PIXEL
+                    dilated_cloud = 1 << 1
+                    cirrus        = 1 << 2
+                    cloud         = 1 << 3
+                
+                    mask = (qa.bitwiseAnd(cloud).eq(0)
+                              .And(qa.bitwiseAnd(cirrus).eq(0)))
+                    
+                    return image.updateMask(mask)
+                
+                im_col = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+                          .filterBounds(aoi_ee)
+                          .filter(ee.Filter.date(date_range[0], date_range[1]))
+                          .filter(ee.Filter.calendarRange(start_month, end_month, 'month')).map(mask_l8_cfmask)
+                          .select(analysis_bands)
+                          )
+            else:
+            """
             im_col = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
                       .filterBounds(aoi_ee)
                       .filter(ee.Filter.date(date_range[0], date_range[1]))
@@ -399,6 +426,41 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
                 col_name = "COPERNICUS/S2_HARMONIZED"
             elif dataset == 'Sentinel-2_SR':
                 col_name = "COPERNICUS/S2_SR_HARMONIZED"
+                
+            #CST 09102026 New cloud filter loosely based on GEE tutorial
+            """
+            if mask_clouds:
+                CLOUD_FILTER = 40 # % max cloud cover allowed
+                CLD_PRB_THRESH = 80  # % probability threshold
+                
+                def get_s2_sr_cld_col(aoi, start, end):
+                    s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                              .filterBounds(aoi).filterDate(start, end)
+                              .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER)))
+                    s2_cloudless = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+                                    .filterBounds(aoi).filterDate(start, end))
+                    return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply(
+                        primary=s2_sr, secondary=s2_cloudless,
+                        condition=ee.Filter.equals(leftField='system:index', rightField='system:index')))
+                
+                def add_cloud_mask(image):
+                    cld_prb = ee.Image(image.get('s2cloudless')).select('probability')
+                    is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds')
+                    return image.addBands(is_cloud)
+                
+                def apply_mask(image):
+                    not_cloud = image.select('clouds').eq(0)
+                    return image.updateMask(not_cloud)
+                    
+                im_col = (ee.ImageCollection(col_name)
+                      .filterBounds(aoi_ee)
+                      .filter(ee.Filter.date(date_range[0], date_range[1]))
+                      .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
+                      .map(add_cloud_mask).map(apply_mask)
+                      .select(analysis_bands)
+                      )
+            else:
+            """
             im_col = (ee.ImageCollection(col_name)
                       .filterBounds(aoi_ee)
                       .filter(ee.Filter.date(date_range[0], date_range[1]))
@@ -415,7 +477,7 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
                 "'dataset' variable not recognized. Please set to 'Landsat', 'Sentinel-2_TOA', or 'Sentinel-2_SR'. "
                 "Exiting...")
             return
-
+    
         # Clip to AOI
         def clip_to_aoi(image):
             return image.clip(aoi_ee).copyProperties(ee.Image(image))
@@ -435,11 +497,20 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
         im_col = im_col.map(calculate_ndsi)
 
         # Apply cloud masking approach from Moussavi et al. (2020): https://doi.org/10.3390/rs12010134
+        
         if mask_clouds:
             def create_apply_cloud_mask(image):
+                #Old cloud mask implemetned for areas with NDSI < 0.8 and SWIR > 0.1
+                """
                 ndsi = image.select('NDSI')
                 ndsi_mask = ndsi.lt(0.8)
                 swir_mask = image.select(ndsi_bands[1]).gt(0.1)
+                cloud_mask = ndsi_mask.And(swir_mask).rename('cloud_mask')
+                """
+                #CST 07092026 New cloud mask implemetned for areas with SWIR > 0.4
+                ndsi = image.select('NDSI')
+                ndsi_mask = ndsi.lt(0.8)
+                swir_mask = image.select(ndsi_bands[1]).gt(0.3)
                 cloud_mask = ndsi_mask.And(swir_mask).rename('cloud_mask')
                 # Add NDSI band
                 image = image.addBands(ndsi, None, True)
@@ -488,7 +559,9 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
         # Determine whether images must be downloaded to file
         if not im_download:
             # Estimate image size
-            image_size_bits = aoi_area.getInfo() / (scale ** 2) * len(analysis_bands) * 64
+            #image_size_bits = aoi_area.getInfo() / (scale ** 2) * len(analysis_bands) * 64
+            #CST 09012026 fixed aoi_area.getInfo() to aoi_area
+            image_size_bits = aoi_area / (scale ** 2) * len(analysis_bands) * 64
             image_size_mb = image_size_bits / (8 * 1024 * 1024)
             # If image size > 10 MB, images must be downloaded
             if image_size_mb > 10:
@@ -502,7 +575,8 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
                 os.mkdir(out_path)
 
         # Download images by date
-        im_xr_list = []
+        #CST 09012026 im_xr_list needs to be initialized outside of the initial for loop
+        #im_xr_list = []
         dates = im_col_mosaicked_filtered.aggregate_array('system:time_start').map(
             lambda t: ee.Date(t).format('YYYY-MM-dd')).distinct().getInfo()
         print(f'number of dates in subsetted image collection '+str(len(dates)))
@@ -532,7 +606,7 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
             # Reproject to UTM for better distance calculations later
             im_xr = im_xr.rio.write_crs("EPSG:4326")
             im_xr = im_xr.rio.reproject(f'EPSG:{epsg_utm}', nodata=np.nan)
-
+            
             if run_pipeline:
                 # -----Run classification pipeline
                 apply_classification_pipeline(im_xr, dataset_dict, dataset, site_name, im_classified_path,
@@ -1203,6 +1277,7 @@ def apply_classification_pipeline(im_xr, dataset_dict, dataset, site_name, im_cl
     scs_df: pandas.DataFrame
         resulting data table containing snow cover statistics and snowline geometry
     """
+    
     # Grab image date string from time variable
     im_date = str(im_xr.time.data[0].astype('datetime64[D]'))
 

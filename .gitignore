@@ -6,6 +6,7 @@
 
 # figures - must be uploaded directly to GitHub
 figures/
+Alaska
 
 # .zip folders of study area shapefiles
 inputs-outputs/*.zip
