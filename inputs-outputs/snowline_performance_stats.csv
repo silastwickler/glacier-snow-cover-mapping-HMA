@@ -1,6 +1,0 @@
-dataset,ground distance median [m],ground distance IQR [m],elevation difference median [m],elevation difference IQR [m],N
-Landsat,211.1811871,374.5846462,-60,115.6220703,29
-PlanetScope,153.9577071,236.3401004,-30.135498,53,77
-Sentinel-2_SR,49.70631219,158.1015212,-5.991699219,40.37304688,37
-Sentinel-2_TOA,48.8461007,184.9000962,-16.73632813,53.73632813,61
-All datasets AVERAGE,115.9228268,238.481591,-28.21588134,65.68286133,204
