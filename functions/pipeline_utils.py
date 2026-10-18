@@ -300,7 +300,65 @@ def query_gee_for_dem(aoi_utm, site_name, out_path=None):
     return dem_ds
 
 
-def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, end_month, mask_clouds,
+def S2SRcloudpercent(image,ROI):
+    aveCloud = image.select('MSK_CLDPRB').reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=ROI,
+        maxPixels=1e9
+        )
+    return image.set({'CLOUDY_PIXEL_PERCENTAGE': aveCloud.get('MSK_CLDPRB')})
+
+def S2TOAcloudpercent(image, aoi):
+    # Using QA60 bitmask (bit 10 = clouds, bit 11 = cirrus)
+    qa = image.select('QA60')
+    cloud_bit = 1 << 10
+    cirrus_bit = 1 << 11
+    cloud_mask = qa.bitwiseAnd(cloud_bit).eq(0).And(qa.bitwiseAnd(cirrus_bit).eq(0))
+
+    # cloud_mask == 1 means clear; invert to get "is cloud"
+    is_cloud = cloud_mask.eq(0)
+
+    cloud_stats = is_cloud.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=aoi,
+        scale=60,           # match QA60 native resolution
+        maxPixels=1e9
+    )
+
+    cloud_pct = ee.Number(cloud_stats.get('QA60')).multiply(100)
+
+    return image.set('ROI_CLOUD_COVER', cloud_pct)
+
+def LScloudpercent(image, ROI):
+    # Using QA_PIXEL bitmask (Landsat Collection 2 Level-2)
+    # bit 1 = Dilated Cloud, bit 2 = Cirrus, bit 3 = Cloud, bit 4 = Cloud Shadow
+    qa = image.select('QA_PIXEL')
+    dilated_cloud_bit = 1 << 1
+    cirrus_bit = 1 << 2
+    cloud_bit = 1 << 3
+    shadow_bit = 1 << 4
+
+    clear_mask = (qa.bitwiseAnd(dilated_cloud_bit).eq(0)
+                  .And(qa.bitwiseAnd(cirrus_bit).eq(0))
+                  .And(qa.bitwiseAnd(cloud_bit).eq(0))
+                  .And(qa.bitwiseAnd(shadow_bit).eq(0)))
+
+    # clear_mask == 1 means clear; invert to get "is cloud/shadow"
+    is_cloud = clear_mask.eq(0)
+
+    cloud_stats = is_cloud.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=ROI,
+        scale=30,            # match QA_PIXEL native resolution
+        maxPixels=1e9
+    )
+
+    cloud_pct = ee.Number(cloud_stats.get('QA_PIXEL')).multiply(100)
+    return image.set('ROI_CLOUD_COVER', cloud_pct)
+
+
+
+def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, end_month, mask_clouds, max_cloud_cover,
                           percent_aoi_coverage, im_download, out_path, run_pipeline, dataset_dict, site_name,
                           im_classified_path, scs_path, dem, clf, feature_cols, figures_out_path,
                           plot_results, verbose, delineate_snowline=False):
@@ -382,34 +440,20 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
     for date_range in tqdm(date_ranges):
         print(f'date range for image query = '+str(date_range))
         # Query for imagery
+        #New updated cloud filter
         if dataset == 'Landsat':
             # Get full collection for dates and bounds
-            
-            #CST 09102026 New cloud filter using Landsat CFMask
-            """
             if mask_clouds:
-                print("Cloud Filter")
-                def mask_l8_cfmask(image):
-                    qa = image.select('QA_PIXEL')
-                    #Landsat Collection 2 Level-2 QA_PIXEL
-                    dilated_cloud = 1 << 1
-                    cirrus        = 1 << 2
-                    cloud         = 1 << 3
-                
-                    mask = (qa.bitwiseAnd(cloud).eq(0)
-                              .And(qa.bitwiseAnd(cirrus).eq(0)))
-                    
-                    return image.updateMask(mask)
-                
                 im_col = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
-                          .filterBounds(aoi_ee)
-                          .filter(ee.Filter.date(date_range[0], date_range[1]))
-                          .filter(ee.Filter.calendarRange(start_month, end_month, 'month')).map(mask_l8_cfmask)
-                          .select(analysis_bands)
-                          )
-            else:
-            """
-            im_col = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+                      .filterBounds(aoi_ee)
+                      .filter(ee.Filter.date(date_range[0], date_range[1]))
+                      .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
+                      .map(lambda image: LScloudpercent(image, aoi_ee))
+                      .filterMetadata('ROI_CLOUD_COVER', 'less_than', max_cloud_cover)
+                      .select(analysis_bands)
+                      )
+            else: 
+                im_col = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
                       .filterBounds(aoi_ee)
                       .filter(ee.Filter.date(date_range[0], date_range[1]))
                       .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
@@ -424,44 +468,28 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
             # Get full collection for dates and bounds
             if dataset == 'Sentinel-2_TOA':
                 col_name = "COPERNICUS/S2_HARMONIZED"
+                if mask_clouds:
+                    im_col = (ee.ImageCollection(col_name)
+                          .filterBounds(aoi_ee)
+                          .filter(ee.Filter.date(date_range[0], date_range[1]))
+                          .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
+                          .map(lambda image: S2TOAcloudpercent(image, aoi_ee))
+                          .filterMetadata('ROI_CLOUD_COVER', 'less_than', max_cloud_cover)
+                          .select(analysis_bands)
+                          )
             elif dataset == 'Sentinel-2_SR':
                 col_name = "COPERNICUS/S2_SR_HARMONIZED"
-                
-            #CST 09102026 New cloud filter loosely based on GEE tutorial
-            """
-            if mask_clouds:
-                CLOUD_FILTER = 40 # % max cloud cover allowed
-                CLD_PRB_THRESH = 80  # % probability threshold
-                
-                def get_s2_sr_cld_col(aoi, start, end):
-                    s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                              .filterBounds(aoi).filterDate(start, end)
-                              .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER)))
-                    s2_cloudless = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-                                    .filterBounds(aoi).filterDate(start, end))
-                    return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply(
-                        primary=s2_sr, secondary=s2_cloudless,
-                        condition=ee.Filter.equals(leftField='system:index', rightField='system:index')))
-                
-                def add_cloud_mask(image):
-                    cld_prb = ee.Image(image.get('s2cloudless')).select('probability')
-                    is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds')
-                    return image.addBands(is_cloud)
-                
-                def apply_mask(image):
-                    not_cloud = image.select('clouds').eq(0)
-                    return image.updateMask(not_cloud)
-                    
+                if mask_clouds:
+                    im_col = (ee.ImageCollection(col_name)
+                          .filterBounds(aoi_ee)
+                          .filter(ee.Filter.date(date_range[0], date_range[1]))
+                          .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
+                          .map(lambda image: S2SRcloudpercent(image, aoi_ee))
+                          .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', "less_than", max_cloud_cover)
+                          .select(analysis_bands)
+                          )
+            if mask_clouds == False:
                 im_col = (ee.ImageCollection(col_name)
-                      .filterBounds(aoi_ee)
-                      .filter(ee.Filter.date(date_range[0], date_range[1]))
-                      .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
-                      .map(add_cloud_mask).map(apply_mask)
-                      .select(analysis_bands)
-                      )
-            else:
-            """
-            im_col = (ee.ImageCollection(col_name)
                       .filterBounds(aoi_ee)
                       .filter(ee.Filter.date(date_range[0], date_range[1]))
                       .filter(ee.Filter.calendarRange(start_month, end_month, 'month'))
@@ -497,7 +525,7 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
         im_col = im_col.map(calculate_ndsi)
 
         # Apply cloud masking approach from Moussavi et al. (2020): https://doi.org/10.3390/rs12010134
-        
+        '''
         if mask_clouds:
             def create_apply_cloud_mask(image):
                 #Old cloud mask implemetned for areas with NDSI < 0.8 and SWIR > 0.1
@@ -518,7 +546,7 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
                 image_masked = image.updateMask(cloud_mask.Not())
                 return image_masked.copyProperties(ee.Image(image))
             im_col = im_col.map(create_apply_cloud_mask)
-
+        '''
         # Mosaic images captured same day
         def mosaic_image_collection_by_date(collection):
             # Functions to mosaic images for each date
@@ -618,7 +646,7 @@ def query_gee_for_imagery(aoi_utm, dataset, start_date, end_date, start_month, e
     return im_xr_list
 
 
-def query_gee_for_imagery_yearly(aoi_utm, dataset, start_date, end_date, start_month, end_month, mask_clouds,
+def query_gee_for_imagery_yearly(aoi_utm, dataset, start_date, end_date, start_month, end_month, mask_clouds, max_cloud_cover,
                                  percent_aoi_coverage, im_download, out_path, run_pipeline=False, dataset_dict=None,
                                  site_name=None, im_classified_path=None, scs_path=None, dem=None,
                                  clf=None, feature_cols=None, figures_out_path=None, plot_results=None, verbose=False, delineate_snowline=False):
@@ -652,7 +680,7 @@ def query_gee_for_imagery_yearly(aoi_utm, dataset, start_date, end_date, start_m
             print(' ')
             print(date_range[0], date_range[1])
         im_list += query_gee_for_imagery(aoi_utm, dataset, date_range[0], date_range[1], start_month, end_month,
-                                         mask_clouds, percent_aoi_coverage, im_download, out_path, run_pipeline,
+                                         mask_clouds, max_cloud_cover, percent_aoi_coverage, im_download, out_path, run_pipeline,
                                          dataset_dict, site_name, im_classified_path, scs_path, dem, clf,
                                          feature_cols, figures_out_path, plot_results, verbose, delineate_snowline)
 
@@ -796,11 +824,23 @@ def classify_image(im_xr, clf, feature_cols, aoi, dataset_dict, dataset, im_clas
     df = df.reset_index(drop=True)
 
     # -----Classify image
+    class_to_int = {
+        'Snow': 1, 'Shadowed snow': 2, 'Ice': 3, 'Debris': 4,
+        'Rock': 5, 'Water': 6, 'Cloud': 7,
+        **{i: i for i in range(1, 8)},
+    }
     try:
         array_classified = clf.predict(df[feature_cols])
-        # reshape from flat array to original shape
+        array_classified_int = np.array(
+            [class_to_int[label] for label in array_classified], dtype=float
+        )
+    
         im_classified = np.full(im_aoi.to_array().data[0].shape, np.nan)
-        im_classified[ireal] = array_classified
+        im_classified[ireal] = array_classified_int
+    except KeyError as e:
+        if verbose:
+            print(f"Unrecognized class label in prediction: {e}")
+        return 'N/A'
     except NotFittedError:
         if verbose:
             print("Classifier is not fitted, skipping...")
@@ -828,7 +868,7 @@ def classify_image(im_xr, clf, feature_cols, aoi, dataset_dict, dataset, im_clas
     # add additional attributes to image before saving
     im_classified_xr_int = im_classified_xr_int.assign_attrs({'Description': 'Classified image',
                                                               'Classes': '1 = Snow, 2 = Shadowed snow, 3 = Ice, '
-                                                                         '4 = Rock, 5 = Water',
+                                                                         '4 = Debris, 5 = Rock, 6 = Water, 7 = Cloud',
                                                               'source': dataset,
                                                               'date': str(im_date),
                                                               '_FillValue': '-9999'
@@ -983,10 +1023,13 @@ def calculate_snow_cover_stats(dataset_dict, dataset, im_date, im_xr=None, im_cl
                                     im_xr[dataset_dict[dataset]['RGB_bands'][2]].values]),
                          extent=(np.min(im_xr.x.data) / 1e3, np.max(im_xr.x.data) / 1e3,
                                  np.min(im_xr.y.data) / 1e3, np.max(im_xr.y.data) / 1e3))
-        # classified image
-        ax[1].imshow(im_classified['classified'].data, cmap=cmp, clim=(1, 5),
+        # Fix so that it will work regardless of class size
+        bounds = np.arange(0.5, len(colors) + 1.5, 1)   # [0.5, 1.5, ..., 7.5] for 7 classes
+        norm = matplotlib.colors.BoundaryNorm(bounds, cmp.N)
+        
+        ax[1].imshow(im_classified['classified'].data, cmap=cmp, norm=norm,
                      extent=(np.min(im_classified.x.data) / 1e3, np.max(im_classified.x.data) / 1e3,
-                             np.min(im_classified.y.data) / 1e3, np.max(im_classified.y.data) / 1e3))
+                     np.min(im_classified.y.data) / 1e3, np.max(im_classified.y.data) / 1e3))
         # snowline coordinates
         if delineate_snowline:
             if (len(snowlines_coords_x) > 0):
@@ -1000,8 +1043,10 @@ def calculate_snow_cover_stats(dataset_dict, dataset, im_date, im_xr=None, im_cl
         ax[1].scatter(0, 0, color=colors[0], s=30, marker='s', label='Snow')
         ax[1].scatter(0, 0, color=colors[1], s=30, marker='s', label='Shadowed snow')
         ax[1].scatter(0, 0, color=colors[2], s=30, marker='s', label='Ice')
-        ax[1].scatter(0, 0, color=colors[3], s=30, marker='s', label='Rock')
-        ax[1].scatter(0, 0, color=colors[4], s=30, marker='s', label='Water')
+        ax[1].scatter(0, 0, color=colors[3], s=30, marker='s', label='Debris')
+        ax[1].scatter(0, 0, color=colors[4], s=30, marker='s', label='Rock')
+        ax[1].scatter(0, 0, color=colors[5], s=30, marker='s', label='Water')
+        ax[1].scatter(0, 0, color=colors[6], s=30, marker='s', label='Cloud')
         ax[0].set_ylabel('Northing [km]')
         ax[0].set_xlabel('Easting [km]')
         ax[1].set_xlabel('Easting [km]')
